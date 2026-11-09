@@ -1,45 +1,205 @@
+// The game archives are far too big for GitHub Pages to publish (a 600 MB site
+// blows past the deploy timeout), so they live on the `game-assets` branch and
+// are streamed from raw.githubusercontent.com, which serves them with CORS and
+// range support. Append ?assets=local to load them relative to this page when
+// you have the .tar chunks next to it (local checkout / file:// copy).
+const ASSET_CDN = "https://raw.githubusercontent.com/mywebsitekeepsgettingblocked/stardew-wasm/game-assets/";
+const useLocalAssets = location.protocol === "file:" ||
+	new URLSearchParams(location.search).get("assets") === "local";
+const ASSET_BASE = useLocalAssets ? "" : ASSET_CDN;
+
+const MB = 1048576;
+const CHUNK_PARALLELISM = 4;
+const FETCH_ATTEMPTS = 4;
+
 const loading = document.getElementById("loading");
 const canvas = document.getElementById("canvas");
 const musicChoice = document.getElementById("music-choice");
+const statusBox = document.getElementById("status");
+const statusText = document.getElementById("status-text");
+const statusDetail = document.getElementById("status-detail");
+const barFill = document.getElementById("bar-fill");
+const errorBox = document.getElementById("error");
+
+let started = false;
+const abort = new AbortController();
+
+// --- UI ---
+function formatBytes(bytes) {
+	if (!bytes) return "0 MB";
+	if (bytes >= 1024 * MB) return `${(bytes / 1024 / MB).toFixed(2)} GB`;
+	return `${Math.round(bytes / MB)} MB`;
+}
+
+function setStatus(text, fraction, detail = "") {
+	musicChoice.hidden = true;
+	errorBox.hidden = true;
+	statusBox.hidden = false;
+	if (statusText.textContent !== text) statusText.textContent = text;
+	statusDetail.textContent = detail;
+	if (typeof fraction === "number" && Number.isFinite(fraction)) {
+		barFill.classList.remove("indeterminate");
+		barFill.style.width = `${Math.max(0, Math.min(1, fraction)) * 100}%`;
+	} else {
+		barFill.classList.add("indeterminate");
+	}
+}
+
+function describeError(error) {
+	if (!error) return "Unknown error.";
+	const name = error.name && error.name !== "Error" ? `${error.name}: ` : "";
+	return `${name}${error.message || String(error)}`;
+}
+
+function showError(title, error) {
+	statusBox.hidden = true;
+	musicChoice.hidden = true;
+	errorBox.hidden = false;
+	errorBox.replaceChildren();
+	const heading = document.createElement("div");
+	heading.className = "error-title";
+	heading.textContent = title;
+	const detail = document.createElement("div");
+	detail.className = "error-detail";
+	detail.textContent = describeError(error);
+	const retry = document.createElement("button");
+	retry.type = "button";
+	retry.textContent = "Reload";
+	retry.addEventListener("click", () => location.reload());
+	errorBox.append(heading, detail, retry);
+}
+
+window.addEventListener("unhandledrejection", (event) => {
+	if (started) { console.error(event.reason); return; }
+	showError("The game failed to load", event.reason);
+});
+window.addEventListener("error", (event) => {
+	if (started) { console.error(event.error ?? event.message); return; }
+	showError("The game failed to load", event.error ?? event.message);
+});
 
 // --- OPFS helpers ---
-const opfs = await navigator.storage.getDirectory();
-// Ask the browser not to evict the cached content or save archive under storage
-// pressure. Browsers may decline, so this is deliberately best-effort.
-void navigator.storage.persist?.().catch(() => false);
+// The origin private file system needs a secure context and isn't available in
+// every browser mode (private windows, some embedded webviews). Saves simply
+// won't persist when it's missing, but the game itself still has to boot.
+let opfs = null;
+try {
+	opfs = await navigator.storage.getDirectory();
+	// Ask the browser not to evict the cached content or save archive under storage
+	// pressure. Browsers may decline, so this is deliberately best-effort.
+	void navigator.storage.persist?.().catch(() => false);
+} catch (error) {
+	console.warn("Origin private file system unavailable; the game content won't be cached between visits.", error);
+}
+
+const memoryFiles = new Map();
 
 async function opfsHas(name) {
+	if (!opfs) return memoryFiles.has(name);
 	try { await opfs.getFileHandle(name); return true; } catch { return false; }
 }
 async function opfsRead(name) {
+	if (!opfs) {
+		const cached = memoryFiles.get(name);
+		if (cached) return cached;
+		throw new DOMException(`No cached ${name}`, "NotFoundError");
+	}
 	return new Uint8Array(await (await (await opfs.getFileHandle(name)).getFile()).arrayBuffer());
 }
 
+// --- Network helpers ---
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function fetchWithRetry(url, { attempts = FETCH_ATTEMPTS, signal = abort.signal } = {}) {
+	let lastError;
+	for (let attempt = 1; attempt <= attempts; attempt++) {
+		try {
+			const response = await fetch(url, { signal });
+			if (response.ok) return response;
+			// Transient upstream failures (Pages hiccups, rate limits) are worth retrying.
+			if (response.status < 500 && response.status !== 429)
+				throw new Error(`HTTP ${response.status} for ${url}`);
+			lastError = new Error(`HTTP ${response.status} for ${url}`);
+		} catch (error) {
+			if (signal.aborted) throw error;
+			lastError = error;
+		}
+		if (attempt < attempts) await sleep(400 * attempt);
+	}
+	throw lastError ?? new Error(`Failed to fetch ${url}`);
+}
+
 async function fetchChunkCount(url) {
-	const response = await fetch(url);
-	if (!response.ok) throw new Error(`Failed to fetch ${url}: HTTP ${response.status}`);
+	const response = await fetchWithRetry(url);
 	const text = (await response.text()).trim();
 	if (!/^\d+$/.test(text) || Number(text) < 1)
 		throw new Error(`Invalid chunk count in ${url}: ${JSON.stringify(text)}`);
 	return Number(text);
 }
 
+function chunkUrl(base, index) {
+	return `${base}${String(index).padStart(2, "0")}`;
+}
+
+// Exact byte total, so the progress bar means something. The last chunk is
+// usually short, so its size can't be derived from the others.
+async function estimateTotalBytes(base, count) {
+	const headSize = async (index) => {
+		try {
+			const response = await fetch(chunkUrl(base, index), { method: "HEAD", signal: abort.signal });
+			if (!response.ok) return 0;
+			return Number(response.headers.get("content-length")) || 0;
+		} catch { return 0; }
+	};
+	const first = await headSize(0);
+	if (!first) return 0;
+	if (count === 1) return first;
+	const last = await headSize(count - 1);
+	return last ? first * (count - 1) + last : first * count;
+}
+
 // --- Chunked tar download ---
+// Chunks are fetched several at a time (a 540 MB archive over GitHub Pages is
+// painfully slow one-by-one) but streamed into `writeChunk` strictly in order.
 async function readTarChunks(base, label, writeChunk) {
-	loading.textContent = `Downloading ${label}...`;
 	const count = await fetchChunkCount(base + ".count");
+	const estimateP = estimateTotalBytes(base, count).catch(() => 0);
+
+	const pending = new Map();
+	let nextToStart = 0;
+	const startFetch = (index) => {
+		if (index >= count || pending.has(index)) return;
+		const promise = fetchWithRetry(chunkUrl(base, index));
+		promise.catch(() => {}); // surfaced when awaited below
+		pending.set(index, promise);
+	};
+
 	let total = 0;
-	for (let i = 0; i < count; i++) {
-		const res = await fetch(`${base}${String(i).padStart(2, "0")}`);
-		if (!res.ok) throw new Error(`Failed to fetch ${res.url}: HTTP ${res.status}`);
-		if (!res.body) throw new Error(`Streaming response body unavailable for ${res.url}`);
-		const reader = res.body.getReader();
+	let estimate = 0;
+	const report = () => {
+		const fraction = estimate ? Math.min(1, total / estimate) : null;
+		setStatus(`Downloading ${label}`, fraction,
+			`${formatBytes(total)}${estimate ? ` of ${formatBytes(estimate)}` : ""}`);
+	};
+
+	for (let index = 0; index < CHUNK_PARALLELISM && index < count; index++) startFetch(index);
+	nextToStart = Math.min(CHUNK_PARALLELISM, count);
+
+	for (let index = 0; index < count; index++) {
+		// Keep the pipeline full: as soon as one chunk is consumed, queue another.
+		while (nextToStart < count && pending.size < CHUNK_PARALLELISM) startFetch(nextToStart++);
+		const response = await pending.get(index);
+		pending.delete(index);
+		if (!response.body) throw new Error(`Streaming response body unavailable for ${response.url}`);
+		estimate = estimate || (await estimateP);
+		report();
+		const reader = response.body.getReader();
 		for (;;) {
 			const { done, value } = await reader.read();
 			if (done) break;
 			await writeChunk(value);
 			total += value.length;
-			loading.textContent = `Downloading ${label}... ${(total / 1048576) | 0} MB`;
+			report();
 		}
 	}
 	return total;
@@ -55,25 +215,28 @@ async function downloadTarToMemory(base, label) {
 }
 
 async function downloadAndCacheTar(base, label, key) {
+	if (!opfs) return downloadTarToMemory(base, label);
 	let writer;
 	try {
 		writer = await (await opfs.getFileHandle(key, { create: true })).createWritable();
 		await readTarChunks(base, label, (chunk) => writer.write(chunk));
-		loading.textContent = `Caching ${label}...`;
+		setStatus(`Saving ${label}`, null);
 		await writer.close();
 		return await opfsRead(key);
-	} catch {
+	} catch (error) {
 		try { await writer?.abort(); } catch {}
 		// A failed OPFS write can leave a newly-created zero-byte handle. Never let
 		// that masquerade as a valid cached archive on the next launch.
 		try { await opfs.removeEntry(key); } catch {}
+		if (error?.name === "AbortError") throw error;
+		console.warn(`Couldn't cache ${label} in the origin private file system; keeping it in memory instead.`, error);
 		return await downloadTarToMemory(base, label);
 	}
 }
 
 async function getTar(base, label, key) {
 	try {
-		loading.textContent = `Loading cached ${label}...`;
+		setStatus(`Loading cached ${label}`, null);
 		return await opfsRead(key);
 	} catch {
 		return await downloadAndCacheTar(base, label, key);
@@ -83,17 +246,31 @@ async function getTar(base, label, key) {
 // --- Music choice (skip if audio already cached) ---
 const audioCached = await opfsHas("ContentAudio.tar");
 const wantMusic = audioCached || await new Promise((resolve) => {
-	musicChoice.style.display = "";
-	document.getElementById("btn-no-music").onclick = () => { musicChoice.style.display = "none"; resolve(false); };
-	document.getElementById("btn-with-music").onclick = () => { musicChoice.style.display = "none"; resolve(true); };
+	musicChoice.hidden = false;
+	document.getElementById("btn-no-music").onclick = () => { musicChoice.hidden = true; resolve(false); };
+	document.getElementById("btn-with-music").onclick = () => { musicChoice.hidden = true; resolve(true); };
 });
-musicChoice.style.display = "none";
+musicChoice.hidden = true;
 
 // --- Parallel: download tars + boot runtime ---
-const contentP = getTar("Content.tar", "game content", "Content.tar");
-const audioP = wantMusic ? getTar("ContentAudio.tar", "music", "ContentAudio.tar") : Promise.resolve(null);
+const contentP = getTar(ASSET_BASE + "Content.tar", "game content", "Content.tar");
+const audioP = wantMusic ? getTar(ASSET_BASE + "ContentAudio.tar", "music", "ContentAudio.tar") : Promise.resolve(null);
 const runtimeP = (async () => {
-	const { dotnet } = await import("./_framework/dotnet.js");
+	// A readable message instead of a bare "failed to fetch dynamically imported
+	// module". The _framework folder is the usual casualty: GitHub Pages runs
+	// Jekyll unless a .nojekyll file sits next to this one, and Jekyll drops every
+	// folder whose name starts with an underscore.
+	let mod;
+	try {
+		mod = await import("./_framework/dotnet.js");
+	} catch (error) {
+		throw new Error(
+			"Couldn't load _framework/dotnet.js. If this site is on GitHub Pages, " +
+			"make sure a .nojekyll file is published so the _framework folder isn't " +
+			`stripped by Jekyll. (${describeError(error)})`
+		);
+	}
+	const { dotnet } = mod;
 	return dotnet
 		.withModuleConfig({ canvas })
 		.withEnvironmentVariable("MONO_SLEEP_ABORT_LIMIT", "99999")
@@ -136,7 +313,15 @@ const runtimeP = (async () => {
 		.create();
 })();
 
-const [contentTar, audioTar, runtime] = await Promise.all([contentP, audioP, runtimeP]);
+let contentTar, audioTar, runtime;
+try {
+	setStatus("Downloading game files", null);
+	[contentTar, audioTar, runtime] = await Promise.all([contentP, audioP, runtimeP]);
+} catch (error) {
+	abort.abort(); // stop any downloads that are still running for nothing
+	throw error;
+}
+
 const exports = await runtime.getAssemblyExports(runtime.getConfig().mainAssemblyName);
 
 // --- Validate and extract tar into WasmFS ---
@@ -226,6 +411,7 @@ function extractTar(tar, prefix) {
 	return count;
 }
 
+setStatus("Starting the game runtime", null);
 await runtime.runMain();
 await exports.WasmBootstrap.PreInit();
 
@@ -247,11 +433,12 @@ try {
 	if (error?.name !== "NotFoundError") console.error("Couldn't restore DevicePreferences.tar; archive was ignored:", error);
 }
 
-loading.textContent = "Loading game files...";
+setStatus("Loading game files", null);
 extractTar(contentTar, "/libsdl/");
-if (audioTar) { loading.textContent = "Loading music..."; extractTar(audioTar, "/libsdl/"); }
+if (audioTar) { setStatus("Loading music", null); extractTar(audioTar, "/libsdl/"); }
 
 loading.classList.add("hidden");
+started = true;
 
 const dpr = window.devicePixelRatio || 1;
 const w = Math.round(canvas.clientWidth * dpr) || 1280;
